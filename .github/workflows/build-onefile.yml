@@ -2,19 +2,18 @@ name: Build OneFile from PenguLoader (Release)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"     # every 30 minutes
-  workflow_dispatch: {}         # manual run
+    - cron: "*/30 * * * *"        # every 30 minutes
+  workflow_dispatch: {}            # manual run
 
 permissions:
-  contents: write               # needed for creating releases and uploading assets
+  contents: write                  # needed for creating releases and uploading assets
 
 concurrency:
   group: pengu-onefile
   cancel-in-progress: true
 
 env:
-  # Consistent TZ for dating the filenames
-  TZ: Europe/Amsterdam
+  TZ: Europe/Amsterdam             # consistent dating in filenames
 
 jobs:
   build:
@@ -28,8 +27,9 @@ jobs:
 
       - name: Ensure basic tools
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq curl git
+          sudo apt-get install -y jq curl git gh
 
       - name: Resolve latest upstream commit (PenguLoader/PenguLoader)
         id: latest
@@ -88,18 +88,20 @@ jobs:
           fi
 
       - name: Run onefilellm (produce compressed/uncompressed files)
+        id: run_onefilellm                            # <-- IMPORTANT: add id so we can read outputs
         if: >
           github.event_name == 'workflow_dispatch' ||
           steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # not required for local path, but harmless
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # harmless for local-path mode
         run: |
           set -euo pipefail
+          set -x
 
           # Generate files in CWD:
           python 1filellm/onefilellm.py work/PenguLoader
 
-          # Build filenames exactly as requested, including local (Amsterdam) date
+          # Build filenames exactly as requested, including Amsterdam date
           DATE=$(date "+%Y-%m-%d")
           REPO_NAME="PenguLoader"
 
@@ -136,21 +138,22 @@ jobs:
           steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DATE: ${{ steps.run_onefilellm.outputs.build_date }}
+          COMPRESSED: ${{ steps.run_onefilellm.outputs.compressed_path }}
+          UNCOMPRESSED: ${{ steps.run_onefilellm.outputs.uncompressed_path }}
         run: |
           set -euo pipefail
+          set -x
 
-          # Tag & release name include date
-          DATE="${{ steps.run_onefilellm.outputs.build_date || '' }}"
-          if [ -z "$DATE" ]; then DATE=$(date "+%Y-%m-%d"); fi
+          # Fallbacks (shouldn't be needed if previous step succeeded)
+          : "${DATE:=$(date "+%Y-%m-%d")}"
+          : "${COMPRESSED:?COMPRESSED missing}"
+          : "${UNCOMPRESSED:?UNCOMPRESSED missing}"
 
           TAG="penguloader-ofl-${DATE}"
           NAME="PenguLoader OneFile LLM (${DATE})"
 
-          COMPRESSED="${{ steps.run_onefilellm.outputs.compressed_path }}"
-          UNCOMPRESSED="${{ steps.run_onefilellm.outputs.uncompressed_path }}"
-
-          # Install GitHub CLI
-          type -p gh >/dev/null || sudo apt-get install -y gh
+          echo "Release URL will be: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
 
           # Create or update the release (idempotent)
           if gh release view "$TAG" >/dev/null 2>&1; then
