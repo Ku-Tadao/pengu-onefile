@@ -3,7 +3,7 @@ name: Build OneFile from PenguLoader (local script)
 on:
   schedule:
     - cron: "*/30 * * * *"   # every 30 minutes
-  workflow_dispatch: {}
+  workflow_dispatch: {}       # manual run
 
 permissions:
   contents: write
@@ -51,33 +51,37 @@ jobs:
             echo "last_sha=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Short-circuit if nothing changed
-        if: steps.latest.outputs.latest_sha == steps.last.outputs.last_sha
-        run: echo "No new commits on PenguLoader; skipping."
-
       - name: Clone PenguLoader (depth=1)
-        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        if: >
+          github.event_name == 'workflow_dispatch' ||
+          steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         run: |
           set -euo pipefail
           rm -rf work && mkdir -p work
           git clone --depth 1 https://github.com/PenguLoader/PenguLoader.git work/PenguLoader
 
       - name: Set up Python 3.11.9
-        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        if: >
+          github.event_name == 'workflow_dispatch' ||
+          steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         uses: actions/setup-python@v5
         with:
           python-version: "3.11.9"
           cache: "pip"
 
       - name: Verify Python version
-        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        if: >
+          github.event_name == 'workflow_dispatch' ||
+          steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         run: |
           python -V
           which python
           python -m pip -V
 
       - name: Install Python deps (if present)
-        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        if: >
+          github.event_name == 'workflow_dispatch' ||
+          steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         run: |
           set -euo pipefail
           if [ -f 1filellm/requirements.txt ]; then
@@ -87,28 +91,25 @@ jobs:
             echo "No 1filellm/requirements.txt found; continuing..."
           fi
 
-      - name: Run onefilellm (no stdout redirection)
-        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+      - name: Run onefilellm (force on manual run)
+        if: >
+          github.event_name == 'workflow_dispatch' ||
+          steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         env:
-          # Not strictly needed for local-path mode, but harmless and future-proof
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # This writes uncompressed_output.txt and compressed_output.txt in CWD
           python 1filellm/onefilellm.py work/PenguLoader
 
-          # Ensure output directory exists
           mkdir -p output
-
-          # Stamp filenames with upstream commit SHA
           COMMIT_SHA="${{ steps.latest.outputs.latest_sha }}"
-
-          # Move the REAL outputs produced by the script
           mv compressed_output.txt "output/pengu_onefile_compressed_${COMMIT_SHA}.txt"
           mv uncompressed_output.txt "output/pengu_onefile_uncompressed_${COMMIT_SHA}.txt"
 
       - name: Commit & push results
-        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        if: >
+          github.event_name == 'workflow_dispatch' ||
+          steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         run: |
           set -euo pipefail
           echo "${{ steps.latest.outputs.latest_sha }}" > state/latest_sha.txt
@@ -122,8 +123,10 @@ jobs:
             git push
           fi
 
-      - name: Upload artifact (compressed & uncompressed)
-        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+      - name: Upload artifact
+        if: >
+          github.event_name == 'workflow_dispatch' ||
+          steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         uses: actions/upload-artifact@v4
         with:
           name: pengu-onefile-${{ steps.latest.outputs.latest_sha }}
