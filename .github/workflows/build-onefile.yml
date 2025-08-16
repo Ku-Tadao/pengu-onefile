@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write             # needed to push results back to this repo
+  contents: write
 
 concurrency:
   group: pengu-onefile
@@ -26,8 +26,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl git
-          python3 -V
-          pip3 -V || true
 
       - name: Get latest commit SHA from PenguLoader/PenguLoader
         id: latest
@@ -61,19 +59,26 @@ jobs:
           rm -rf work && mkdir -p work
           git clone --depth 1 https://github.com/PenguLoader/PenguLoader.git work/PenguLoader
 
-      - name: Set up Python
+      - name: Set up Python 3.11.9
         if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.11.9"
           cache: "pip"
+
+      - name: Verify Python version
+        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        run: |
+          python -V
+          which python
+          python -m pip -V
 
       - name: Install Python deps (optional)
         if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         run: |
           if [ -f 1filellm/requirements.txt ]; then
             python -m pip install --upgrade pip
-            pip install -r 1filellm/requirements.txt
+            python -m pip install -r 1filellm/requirements.txt
           else
             echo "No 1filellm/requirements.txt found; continuing..."
           fi
@@ -86,12 +91,7 @@ jobs:
             echo "ERROR: 1filellm/onefilellm.py not found in repo root."
             exit 1
           fi
-
-          # Generate a single consolidated file from the cloned PenguLoader repo.
-          # Your script should write to stdout; we redirect to a file.
           python 1filellm/onefilellm.py work/PenguLoader > output/pengu_onefile.txt
-
-          # Optionally also keep a versioned copy with SHA in the name:
           cp output/pengu_onefile.txt "output/pengu_onefile_${{ steps.latest.outputs.latest_sha }}.txt"
 
       - name: Commit & push results
