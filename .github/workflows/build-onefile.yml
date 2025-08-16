@@ -1,16 +1,20 @@
-name: Build OneFile from PenguLoader (local script)
+name: Build OneFile from PenguLoader (Release)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes
-  workflow_dispatch: {}       # manual run
+    - cron: "*/30 * * * *"     # every 30 minutes
+  workflow_dispatch: {}         # manual run
 
 permissions:
-  contents: write
+  contents: write               # needed for creating releases and uploading assets
 
 concurrency:
   group: pengu-onefile
   cancel-in-progress: true
+
+env:
+  # Consistent TZ for dating the filenames
+  TZ: Europe/Amsterdam
 
 jobs:
   build:
@@ -44,13 +48,14 @@ jobs:
         id: last
         run: |
           set -euo pipefail
-          mkdir -p state output
+          mkdir -p state
           if [ -f state/latest_sha.txt ]; then
             echo "last_sha=$(cat state/latest_sha.txt)" >> "$GITHUB_OUTPUT"
           else
             echo "last_sha=" >> "$GITHUB_OUTPUT"
           fi
 
+      # Run if manual OR new upstream commit
       - name: Clone PenguLoader (depth=1)
         if: >
           github.event_name == 'workflow_dispatch' ||
@@ -69,15 +74,6 @@ jobs:
           python-version: "3.11.9"
           cache: "pip"
 
-      - name: Verify Python version
-        if: >
-          github.event_name == 'workflow_dispatch' ||
-          steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
-        run: |
-          python -V
-          which python
-          python -m pip -V
-
       - name: Install Python deps (if present)
         if: >
           github.event_name == 'workflow_dispatch' ||
@@ -91,22 +87,33 @@ jobs:
             echo "No 1filellm/requirements.txt found; continuing..."
           fi
 
-      - name: Run onefilellm (force on manual run)
+      - name: Run onefilellm (produce compressed/uncompressed files)
         if: >
           github.event_name == 'workflow_dispatch' ||
           steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # not required for local path, but harmless
         run: |
           set -euo pipefail
+
+          # Generate files in CWD:
           python 1filellm/onefilellm.py work/PenguLoader
 
-          mkdir -p output
-          COMMIT_SHA="${{ steps.latest.outputs.latest_sha }}"
-          mv compressed_output.txt "output/pengu_onefile_compressed_${COMMIT_SHA}.txt"
-          mv uncompressed_output.txt "output/pengu_onefile_uncompressed_${COMMIT_SHA}.txt"
+          # Build filenames exactly as requested, including local (Amsterdam) date
+          DATE=$(date "+%Y-%m-%d")
+          REPO_NAME="PenguLoader"
 
-      - name: Commit & push results
+          COMPRESSED="${REPO_NAME}_compressed_LLM_${DATE}.txt"
+          UNCOMPRESSED="${REPO_NAME}_uncompressed_LLM_${DATE}.txt"
+
+          mv compressed_output.txt   "$COMPRESSED"
+          mv uncompressed_output.txt "$UNCOMPRESSED"
+
+          echo "compressed_path=$COMPRESSED"     >> "$GITHUB_OUTPUT"
+          echo "uncompressed_path=$UNCOMPRESSED" >> "$GITHUB_OUTPUT"
+          echo "build_date=$DATE"                >> "$GITHUB_OUTPUT"
+
+      - name: Update last processed SHA file
         if: >
           github.event_name == 'workflow_dispatch' ||
           steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
@@ -115,19 +122,44 @@ jobs:
           echo "${{ steps.latest.outputs.latest_sha }}" > state/latest_sha.txt
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state/latest_sha.txt output/
+          git add state/latest_sha.txt
           if git diff --cached --quiet; then
-            echo "Nothing to commit."
+            echo "Nothing to commit for state."
           else
-            git commit -m "Update for PenguLoader commit ${{ steps.latest.outputs.latest_sha }}"
+            git commit -m "State: processed PenguLoader @ ${{ steps.latest.outputs.latest_sha }}"
             git push
           fi
 
-      - name: Upload artifact
+      - name: Create/Update GitHub Release and upload the two files
         if: >
           github.event_name == 'workflow_dispatch' ||
           steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
-        uses: actions/upload-artifact@v4
-        with:
-          name: pengu-onefile-${{ steps.latest.outputs.latest_sha }}
-          path: output/
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Tag & release name include date
+          DATE="${{ steps.run_onefilellm.outputs.build_date || '' }}"
+          if [ -z "$DATE" ]; then DATE=$(date "+%Y-%m-%d"); fi
+
+          TAG="penguloader-ofl-${DATE}"
+          NAME="PenguLoader OneFile LLM (${DATE})"
+
+          COMPRESSED="${{ steps.run_onefilellm.outputs.compressed_path }}"
+          UNCOMPRESSED="${{ steps.run_onefilellm.outputs.uncompressed_path }}"
+
+          # Install GitHub CLI
+          type -p gh >/dev/null || sudo apt-get install -y gh
+
+          # Create or update the release (idempotent)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; updating assets..."
+          else
+            gh release create "$TAG" --title "$NAME" --notes "Flattened PenguLoader for LLM use. Built on $DATE."
+          fi
+
+          # Upload (replace existing if present)
+          gh release upload "$TAG" "$COMPRESSED" --clobber
+          gh release upload "$TAG" "$UNCOMPRESSED" --clobber
+
