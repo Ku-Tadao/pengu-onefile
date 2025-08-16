@@ -62,7 +62,15 @@ ALLOWED_EXTS = {
     ".cs", ".csproj", ".fs", ".vb", ".xaml",
     # Git/env
     ".gitignore", ".gitattributes", ".env",
+    # Newly added build / platform specific (requested)
+    ".cc", ".mm", ".def", ".rc", ".vcxproj", ".filters", ".sln",
 }
+
+# Files with no extension to always include
+SPECIAL_FILES = {"makefile", ".gitmodules"}
+
+# Image / binary-like assets to mention but not inline contents (including svg per request to not dump body)
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".ico", ".icns", ".bmp", ".gif", ".webp", ".svg"}
 
 # Gate Sci-Hub by default for legal/ToS risks
 ALLOW_SCIHUB = os.getenv("ALLOW_SCIHUB") == "1"
@@ -147,7 +155,10 @@ def is_excluded_file(filename: str) -> bool:
 def is_allowed_filetype(path: str) -> bool:
     if is_excluded_file(path):
         return False
-    _, ext = os.path.splitext(path.lower())
+    name = os.path.basename(path).lower()
+    if name in SPECIAL_FILES:
+        return True
+    _, ext = os.path.splitext(name)
     return ext in ALLOWED_EXTS
 
 
@@ -247,15 +258,28 @@ def process_local_folder(local_path: str) -> str:
         dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
         for file in files:
             full_path = os.path.join(root, file)
+            name_lower = file.lower()
+            rel = os.path.relpath(full_path, local_path)
+            _, ext = os.path.splitext(name_lower)
+            # Image placeholder
+            if ext in IMAGE_EXTS:
+                try:
+                    size = os.path.getsize(full_path)
+                except OSError:
+                    size = 0
+                content.append(f'<file name={escape_xml_attr(rel)} type="image" bytes="{size}" skipped="true" />')
+                continue
             if is_allowed_filetype(full_path):
                 print(f"Processing {full_path}...")
-                relative_path = os.path.relpath(full_path, local_path)
-                content.append(f'<file name={escape_xml_attr(relative_path)}>')
-                if file.endswith(".ipynb"):
+                content.append(f'<file name={escape_xml_attr(rel)}>' )
+                if ext == ".ipynb":
                     content.append(escape_xml_text(process_ipynb_file(full_path)))
                 else:
-                    with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                        content.append(escape_xml_text(f.read()))
+                    try:
+                        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                            content.append(escape_xml_text(f.read()))
+                    except Exception as e:
+                        content.append(f"<error>{escape_xml_text(str(e))}</error>")
                 content.append("</file>")
     content.append("</source>")
     print("All files processed.")
@@ -297,22 +321,28 @@ def process_github_repo(repo_url: str) -> str:
             if f["type"] == "dir" and f["name"] in EXCLUDED_DIRS:
                 continue
 
-            if f["type"] == "file" and is_allowed_filetype(f["name"]):
-                print(f"Processing {f['path']}...")
-                tmp = download_to_temp(f["download_url"])
-                try:
-                    out.append(f'<file name={escape_xml_attr(f["path"])}>')
-                    if f["name"].endswith(".ipynb"):
-                        out.append(escape_xml_text(process_ipynb_file(tmp)))
-                    else:
-                        with open(tmp, "r", encoding="utf-8", errors="ignore") as fh:
-                            out.append(escape_xml_text(fh.read()))
-                    out.append("</file>")
-                finally:
+            if f["type"] == "file":
+                name_lower = f["name"].lower()
+                _, ext = os.path.splitext(name_lower)
+                if ext in IMAGE_EXTS:
+                    out.append(f'<file name={escape_xml_attr(f["path"])} type="image" bytes="{f.get("size",0)}" skipped="true" />')
+                    continue
+                if is_allowed_filetype(f["name"]):
+                    print(f"Processing {f['path']}...")
+                    tmp = download_to_temp(f["download_url"])
                     try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
+                        out.append(f'<file name={escape_xml_attr(f["path"])}>' )
+                        if ext == ".ipynb":
+                            out.append(escape_xml_text(process_ipynb_file(tmp)))
+                        else:
+                            with open(tmp, "r", encoding="utf-8", errors="ignore") as fh:
+                                out.append(escape_xml_text(fh.read()))
+                        out.append("</file>")
+                    finally:
+                        try:
+                            os.remove(tmp)
+                        except OSError:
+                            pass
 
             elif f["type"] == "dir":
                 walk(f["url"], out)
@@ -648,7 +678,17 @@ def process_doi_or_pmid(identifier):
                 f"No PDF found for identifier {identifier}. Sci-hub might be inaccessible or the document is not available."
             )
 
-        content = pdf_element.get("src").replace("#navpanes=0&view=FitH", "").replace("//", "/")
+        # Extract the PDF source attribute (simple robust handling)
+        try:
+            raw_src = getattr(pdf_element, 'get', lambda *_: None)('src')
+            if not raw_src:
+                iframe = getattr(pdf_element, 'find', lambda *a, **k: None)('iframe')
+                raw_src = getattr(iframe, 'get', lambda *_: None)('src') if iframe else None
+            if not raw_src:
+                raise ValueError(f"PDF src attribute not found for identifier {identifier}.")
+            content = str(raw_src).replace("#navpanes=0&view=FitH", "").replace("//", "/")
+        except Exception:
+            raise ValueError(f"PDF src attribute not found for identifier {identifier}.")
 
         if content.startswith("/downloads"):
             pdf_url = "https://sci-hub.se" + content
