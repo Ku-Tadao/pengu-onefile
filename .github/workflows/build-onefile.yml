@@ -1,0 +1,118 @@
+name: Build OneFile from PenguLoader (local script)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch: {}
+
+permissions:
+  contents: write             # needed to push results back to this repo
+
+concurrency:
+  group: pengu-onefile
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out this repo (watcher/output repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure basic tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl git
+          python3 -V
+          pip3 -V || true
+
+      - name: Get latest commit SHA from PenguLoader/PenguLoader
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          API="https://api.github.com/repos/PenguLoader/PenguLoader/commits?per_page=1"
+          LATEST_SHA=$(curl -s -H "Authorization: token ${GH_TOKEN}" "$API" | jq -r '.[0].sha')
+          if [ -z "$LATEST_SHA" ] || [ "$LATEST_SHA" = "null" ]; then
+            echo "Failed to resolve latest SHA from API"; exit 1
+          fi
+          echo "latest_sha=$LATEST_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Read last processed SHA
+        id: last
+        run: |
+          mkdir -p state output
+          if [ -f state/latest_sha.txt ]; then
+            echo "last_sha=$(cat state/latest_sha.txt)" >> "$GITHUB_OUTPUT"
+          else
+            echo "last_sha=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Short-circuit if nothing changed
+        if: steps.latest.outputs.latest_sha == steps.last.outputs.last_sha
+        run: echo "No new commits on PenguLoader; skipping."
+
+      - name: Clone PenguLoader (depth=1)
+        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        run: |
+          rm -rf work && mkdir -p work
+          git clone --depth 1 https://github.com/PenguLoader/PenguLoader.git work/PenguLoader
+
+      - name: Set up Python
+        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+          cache: "pip"
+
+      - name: Install Python deps (optional)
+        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        run: |
+          if [ -f 1filellm/requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r 1filellm/requirements.txt
+          else
+            echo "No 1filellm/requirements.txt found; continuing..."
+          fi
+
+      - name: Run your local onefilellm.py
+        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        run: |
+          set -euo pipefail
+          if [ ! -f "1filellm/onefilellm.py" ]; then
+            echo "ERROR: 1filellm/onefilellm.py not found in repo root."
+            exit 1
+          fi
+
+          # Generate a single consolidated file from the cloned PenguLoader repo.
+          # Your script should write to stdout; we redirect to a file.
+          python 1filellm/onefilellm.py work/PenguLoader > output/pengu_onefile.txt
+
+          # Optionally also keep a versioned copy with SHA in the name:
+          cp output/pengu_onefile.txt "output/pengu_onefile_${{ steps.latest.outputs.latest_sha }}.txt"
+
+      - name: Commit & push results
+        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        run: |
+          echo "${{ steps.latest.outputs.latest_sha }}" > state/latest_sha.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/latest_sha.txt output/pengu_onefile.txt output/pengu_onefile_${{ steps.latest.outputs.latest_sha }}.txt
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Update for PenguLoader commit ${{ steps.latest.outputs.latest_sha }}"
+            git push
+          fi
+
+      - name: Upload CI artifact
+        if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        uses: actions/upload-artifact@v4
+        with:
+          name: pengu_onefile_${{ steps.latest.outputs.latest_sha }}
+          path: |
+            output/pengu_onefile.txt
+            output/pengu_onefile_${{ steps.latest.outputs.latest_sha }}.txt
