@@ -1,130 +1,285 @@
-import requests
-from bs4 import BeautifulSoup, Comment
-from urllib.parse import urljoin, urlparse
-from PyPDF2 import PdfReader
 import os
+import re
 import sys
+import json
+import tempfile
+import pathlib
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import quoteattr  # For safe XML attribute escaping
+from urllib.parse import urljoin, urlparse
+
+import requests
+from requests.adapters import HTTPAdapter, Retry
+from bs4 import BeautifulSoup, Comment
+from PyPDF2 import PdfReader
+
+import nbformat
+from nbconvert import PythonExporter
+
 import tiktoken
 import nltk
 from nltk.corpus import stopwords
-import re
-import nbformat
-from nbconvert import PythonExporter
+
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.formatters import TextFormatter
+
 import pyperclip
 import wget
+
 from rich import print
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 from rich.prompt import Prompt
 from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn
-import xml.etree.ElementTree as ET
-from xml.sax.saxutils import quoteattr  # For safe XML attribute escaping
 
-EXCLUDED_DIRS = ["dist", "node_modules", ".git", "__pycache__"]  # Add any other directories to exclude here
+# ----------------------------
+# Configuration / constants
+# ----------------------------
 
-def safe_file_read(filepath, fallback_encoding='latin1'):
+EXCLUDED_DIRS = ["dist", "node_modules", ".git", "__pycache__"]
+
+ALLOWED_EXTS = {
+    # Docs
+    ".md", ".mdx", ".txt",
+    # JVM / Android
+    ".java", ".kt", ".kts", ".gradle", ".gradle.kts", ".pro", ".properties", ".toml", ".lock", ".xml",
+    # Dart / Flutter
+    ".dart",
+    # Minecraft
+    ".snbt",
+    # Data / schema
+    ".json", ".jsonl", ".yaml", ".yml",
+    # Web
+    ".html", ".js", ".mjs", ".ts", ".mts", ".tsx", ".jsx", ".css",
+    # Shell
+    ".sh", ".bash", ".zsh",
+    # Backends / scripting
+    ".go", ".proto", ".py", ".ipynb",
+    # Native
+    ".rs", ".c", ".cpp", ".h", ".hpp",
+    # .NET / others
+    ".cs", ".csproj", ".fs", ".vb", ".xaml",
+    # Git/env
+    ".gitignore", ".gitattributes", ".env",
+}
+
+# Gate Sci-Hub by default for legal/ToS risks
+ALLOW_SCIHUB = os.getenv("ALLOW_SCIHUB") == "1"
+
+# Optional token: only required for GitHub API usage
+TOKEN = os.getenv("GITHUB_TOKEN")
+HEADERS = {"Authorization": f"token {TOKEN}"} if TOKEN else {}
+
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def require_token(context: str):
+    if not TOKEN:
+        raise EnvironmentError(
+            f"GITHUB_TOKEN is required to process {context}. Provide it via environment variable."
+        )
+
+
+def build_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+    s.headers.update({"User-Agent": "onefilellm/ci"})
+    if TOKEN:
+        s.headers.update({"Authorization": f"token {TOKEN}"})
+    return s
+
+
+SESSION = build_session()
+
+
+def safe_file_read(filepath, fallback_encoding="latin1"):
     try:
-        with open(filepath, "r", encoding='utf-8') as file:
+        with open(filepath, "r", encoding="utf-8") as file:
             return file.read()
     except UnicodeDecodeError:
         with open(filepath, "r", encoding=fallback_encoding) as file:
             return file.read()
 
-nltk.download("stopwords", quiet=True)
-stop_words = set(stopwords.words("english"))
 
-TOKEN = os.getenv('GITHUB_TOKEN', 'default_token_here')
-if TOKEN == 'default_token_here':
-    raise EnvironmentError("GITHUB_TOKEN environment variable not set.")
+def try_copy_to_clipboard(text, console: Console):
+    try:
+        pyperclip.copy(text)
+        console.print("\n[bright_white]Copied to clipboard.[/bright_white]")
+    except Exception as e:
+        console.print(f"\n[bright_black]Clipboard unavailable here: {e} — skipping.[/bright_black]")
 
-headers = {"Authorization": f"token {TOKEN}"}
 
-def download_file(url, target_path):
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
+def escape_xml_text(text: str) -> str:
+    """Escape minimal XML characters for text nodes (& and <). Leave > for readability."""
+    s = str(text)
+    return s.replace("&", "&amp;").replace("<", "&lt;")
+
+
+def escape_xml_attr(value: str) -> str:
+    """Escape and quote an XML attribute value safely (includes surrounding quotes)."""
+    return quoteattr(str(value))
+
+
+def is_excluded_file(filename: str) -> bool:
+    excluded_patterns = [
+        ".pb.go",
+        "_grpc.pb.go",
+        "mock_",
+        "/generated/",
+        "/mocks/",
+        ".gen.",
+        "_generated.",
+    ]
+    return any(pattern in filename for pattern in excluded_patterns)
+
+
+def is_allowed_filetype(path: str) -> bool:
+    if is_excluded_file(path):
+        return False
+    _, ext = os.path.splitext(path.lower())
+    return ext in ALLOWED_EXTS
+
+
+def download_file(url: str, target_path: str):
+    resp = SESSION.get(url, timeout=60)
+    resp.raise_for_status()
     with open(target_path, "wb") as f:
-        f.write(response.content)
+        for chunk in resp.iter_content(chunk_size=1 << 15):
+            if chunk:
+                f.write(chunk)
 
-def process_ipynb_file(temp_file):
-    with open(temp_file, "r", encoding='utf-8', errors='ignore') as f:
+
+def download_to_temp(url: str) -> str:
+    with tempfile.NamedTemporaryFile(prefix="ofl_", delete=False) as tf:
+        path = tf.name
+    resp = SESSION.get(url, timeout=60)
+    resp.raise_for_status()
+    with open(path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1 << 15):
+            if chunk:
+                f.write(chunk)
+    return path
+
+
+def process_ipynb_file(nb_path: str) -> str:
+    with open(nb_path, "r", encoding="utf-8", errors="ignore") as f:
         notebook_content = f.read()
-
     exporter = PythonExporter()
-    python_code, _ = exporter.from_notebook_node(nbformat.reads(notebook_content, as_version=4))
+    python_code, _ = exporter.from_notebook_node(
+        nbformat.reads(notebook_content, as_version=4)
+    )
     return python_code
 
-def process_directory(url, output):
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    files = response.json()
 
-    for file in files:
-        if file["type"] == "dir" and file["name"] in EXCLUDED_DIRS:
-            continue  # Skip excluded directories
+# ----------------------------
+# Tokenization / preprocessing
+# ----------------------------
 
-        if file["type"] == "file" and is_allowed_filetype(file["name"]):
-            print(f"Processing {file['path']}...")
+try:
+    stop_words = set(stopwords.words("english"))
+except LookupError:
+    nltk.download("stopwords", quiet=True)
+    stop_words = set(stopwords.words("english"))
 
-            temp_file = f"temp_{file['name']}"
-            download_file(file["download_url"], temp_file)
 
-            output.write(f"# {'-' * 3}\n")
-            output.write(f"# Filename: {file['path']}\n")
-            output.write(f"# {'-' * 3}\n\n")
+def preprocess_text(input_file, output_file):
+    with open(input_file, "r", encoding="utf-8") as input_file_obj:
+        input_text = input_file_obj.read()
 
-            if file["name"].endswith(".ipynb"):
-                output.write(process_ipynb_file(temp_file))
-            else:
-                with open(temp_file, "r", encoding='utf-8', errors='ignore') as f:
-                    output.write(f.read())
+    def process_text(text):
+        text = re.sub(r"[\n\r]+", "\n", text)
+        text = re.sub(r"[^a-zA-Z0-9\s_.,!?:;@#$%^&*()+\-=\[\]{}|\\<>`~'\"/]+", "", text)
+        text = re.sub(r"\s+", " ", text)
+        text = text.lower()
+        words = text.split()
+        words = [word for word in words if word not in stop_words]
+        return " ".join(words)
 
-            output.write("\n\n")
-            os.remove(temp_file)
-        elif file["type"] == "dir":
-            process_directory(file["url"], output)
+    try:
+        root = ET.fromstring(input_text)
+        for elem in root.iter():
+            if elem.text:
+                elem.text = process_text(elem.text)
+            if elem.tail:
+                elem.tail = process_text(elem.tail)
+        tree = ET.ElementTree(root)
+        tree.write(output_file, encoding="utf-8", xml_declaration=True)
+        print("Text preprocessing completed with XML structure preserved.")
+    except ET.ParseError:
+        processed_text = process_text(input_text)
+        with open(output_file, "w", encoding="utf-8") as out_file:
+            out_file.write(processed_text)
+        print("XML parsing failed. Text preprocessing completed without XML structure.")
 
-def process_local_directory(local_path, output):
+
+def get_token_count(text, disallowed_special=None, chunk_size=1000):
+    if disallowed_special is None:
+        disallowed_special = []
+    enc = tiktoken.get_encoding("cl100k_base")
+    # strip tags for counting
+    text_without_tags = re.sub(r"<[^>]+>", "", text)
+    chunks = [text_without_tags[i : i + chunk_size] for i in range(0, len(text_without_tags), chunk_size)]
+    total_tokens = 0
+    for chunk in chunks:
+        tokens = enc.encode(chunk, disallowed_special=disallowed_special)
+        total_tokens += len(tokens)
+    return total_tokens
+
+
+# ----------------------------
+# Local folder processing
+# ----------------------------
+
+def process_local_folder(local_path: str) -> str:
+    content = [f'<source type="local_directory" path={escape_xml_attr(local_path)}>' ]
     for root, dirs, files in os.walk(local_path):
-        # Modify dirs in-place to exclude specified directories
         dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
-
         for file in files:
-            if is_allowed_filetype(file):
-                print(f"Processing {os.path.join(root, file)}...")
-
-                output.write(f"# {'-' * 3}\n")
-                output.write(f"# Filename: {os.path.join(root, file)}\n")
-                output.write(f"# {'-' * 3}\n\n")
-
-                file_path = os.path.join(root, file)
-
+            full_path = os.path.join(root, file)
+            if is_allowed_filetype(full_path):
+                print(f"Processing {full_path}...")
+                relative_path = os.path.relpath(full_path, local_path)
+                content.append(f'<file name={escape_xml_attr(relative_path)}>')
                 if file.endswith(".ipynb"):
-                    output.write(process_ipynb_file(file_path))
+                    content.append(escape_xml_text(process_ipynb_file(full_path)))
                 else:
-                    with open(file_path, "r", encoding='utf-8', errors='ignore') as f:
-                        output.write(f.read())
+                    with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content.append(escape_xml_text(f.read()))
+                content.append("</file>")
+    content.append("</source>")
+    print("All files processed.")
+    return "\n".join(content)
 
-                output.write("\n\n")
 
-def process_github_repo(repo_url):
+# ----------------------------
+# GitHub repository / PR / Issue processing
+# ----------------------------
+
+def process_github_repo(repo_url: str) -> str:
+    require_token("GitHub repositories")
     api_base_url = "https://api.github.com/repos/"
     repo_url_parts = repo_url.split("https://github.com/")[-1].split("/")
     repo_name = "/".join(repo_url_parts[:2])
 
-    # Detect if we have a branch or tag reference
     branch_or_tag = ""
     subdirectory = ""
     if len(repo_url_parts) > 2 and repo_url_parts[2] == "tree":
-        # The branch or tag name should be at index 3
         if len(repo_url_parts) > 3:
             branch_or_tag = repo_url_parts[3]
-        # Any remaining parts after the branch/tag name form the subdirectory
         if len(repo_url_parts) > 4:
             subdirectory = "/".join(repo_url_parts[4:])
-    
+
     contents_url = f"{api_base_url}{repo_name}/contents"
     if subdirectory:
         contents_url = f"{contents_url}/{subdirectory}"
@@ -133,212 +288,213 @@ def process_github_repo(repo_url):
 
     repo_content = [f'<source type="github_repository" url={escape_xml_attr(repo_url)}>' ]
 
-    def process_directory(url, repo_content):
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        files = response.json()
+    def walk(url, out):
+        resp = SESSION.get(url, timeout=30)
+        resp.raise_for_status()
+        files = resp.json()
 
-        for file in files:
-            if file["type"] == "dir" and file["name"] in EXCLUDED_DIRS:
+        for f in files:
+            if f["type"] == "dir" and f["name"] in EXCLUDED_DIRS:
                 continue
 
-            if file["type"] == "file" and is_allowed_filetype(file["name"]):
+            if f["type"] == "file" and is_allowed_filetype(f["name"]):
+                print(f"Processing {f['path']}...")
+                tmp = download_to_temp(f["download_url"])
+                try:
+                    out.append(f'<file name={escape_xml_attr(f["path"])}>')
+                    if f["name"].endswith(".ipynb"):
+                        out.append(escape_xml_text(process_ipynb_file(tmp)))
+                    else:
+                        with open(tmp, "r", encoding="utf-8", errors="ignore") as fh:
+                            out.append(escape_xml_text(fh.read()))
+                    out.append("</file>")
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
 
-                print(f"Processing {file['path']}...")
+            elif f["type"] == "dir":
+                walk(f["url"], out)
 
-                temp_file = f"temp_{file['name']}"
-                download_file(file["download_url"], temp_file)
-
-                repo_content.append(f'<file name={escape_xml_attr(file["path"])}>' ) 
-                if file["name"].endswith(".ipynb"):
-                    repo_content.append(escape_xml_text(process_ipynb_file(temp_file)))
-                else:
-                    with open(temp_file, "r", encoding='utf-8', errors='ignore') as f:
-                        repo_content.append(escape_xml_text(f.read()))
-                repo_content.append('</file>')
-                os.remove(temp_file)
-
-            elif file["type"] == "dir":
-                process_directory(file["url"], repo_content)
-
-    process_directory(contents_url, repo_content)
-    repo_content.append('</source>')
+    walk(contents_url, repo_content)
+    repo_content.append("</source>")
     print("All files processed.")
-
     return "\n".join(repo_content)
 
-def process_local_folder(local_path):
-    def process_local_directory(local_path):
-        content = [f'<source type="local_directory" path={escape_xml_attr(local_path)}>' ]
-        for root, dirs, files in os.walk(local_path):
-            # Exclude directories
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
 
-            for file in files:
-                if is_allowed_filetype(file):
-                    print(f"Processing {os.path.join(root, file)}...")
+def process_github_pull_request(pull_request_url: str) -> str:
+    require_token("GitHub pull requests")
+    parts = pull_request_url.split("/")
+    repo_owner = parts[3]
+    repo_name = parts[4]
+    pr_number = parts[-1]
 
-                    file_path = os.path.join(root, file)
-                    relative_path = os.path.relpath(file_path, local_path)
-                    content.append(f'<file name={escape_xml_attr(relative_path)}>' )
+    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls/{pr_number}"
 
-                    if file.endswith(".ipynb"):
-                        content.append(escape_xml_text(process_ipynb_file(file_path)))
-                    else:
-                        with open(file_path, "r", encoding='utf-8', errors='ignore') as f:
-                            content.append(escape_xml_text(f.read()))
+    r = SESSION.get(api_url, timeout=30)
+    r.raise_for_status()
+    pr_data = r.json()
 
-                    content.append('</file>')
+    diff_url = pr_data["diff_url"]
+    diff_resp = SESSION.get(diff_url, timeout=60)
+    diff_resp.raise_for_status()
+    pr_diff = diff_resp.text
 
-        content.append('</source>')
-        return '\n'.join(content)
+    comments_url = pr_data["comments_url"]
+    review_comments_url = pr_data["review_comments_url"]
+    c1 = SESSION.get(comments_url, timeout=30); c1.raise_for_status()
+    c2 = SESSION.get(review_comments_url, timeout=30); c2.raise_for_status()
+    comments_data = c1.json()
+    review_comments_data = c2.json()
 
-    formatted_content = process_local_directory(local_path)
-    print("All files processed.")
-    return formatted_content
+    all_comments = comments_data + review_comments_data
+    # sort by 'position' if present
+    all_comments.sort(key=lambda c: (c.get("position") is None, c.get("position", 10**9)))
 
-def process_arxiv_pdf(arxiv_abs_url):
-    pdf_url = arxiv_abs_url.replace("/abs/", "/pdf/") + ".pdf"
-    response = requests.get(pdf_url)
-    pdf_content = response.content
+    formatted = [f'<source type="github_pull_request" url={escape_xml_attr(pull_request_url)}>']
+    formatted.append("<pull_request_info>")
+    formatted.append(f"<title>{escape_xml_text(pr_data.get('title',''))}</title>")
+    formatted.append(f"<description>{escape_xml_text(pr_data.get('body',''))}</description>")
+    formatted.append("<merge_details>")
+    merge_line = (
+        f"{escape_xml_text(pr_data['user']['login'])} wants to merge "
+        f"{pr_data.get('commits','?')} commit into "
+        f"{repo_owner}:{pr_data['base']['ref']} from {pr_data['head']['label']}"
+    )
+    formatted.append(escape_xml_text(merge_line))
+    formatted.append("</merge_details>")
+    formatted.append("<diff_and_comments>")
 
-    with open('temp.pdf', 'wb') as pdf_file:
-        pdf_file.write(pdf_content)
+    diff_lines = pr_diff.split("\n")
+    comment_index = 0
+    for i, line in enumerate(diff_lines):
+        formatted.append(escape_xml_text(line))
+        while comment_index < len(all_comments) and all_comments[comment_index].get("position") == i:
+            c = all_comments[comment_index]
+            formatted.append("<review_comment>")
+            formatted.append(f"<author>{escape_xml_text(c['user']['login'])}</author>")
+            formatted.append(f"<content>{escape_xml_text(c.get('body',''))}</content>")
+            if "path" in c:
+                formatted.append(f"<path>{escape_xml_text(c['path'])}</path>")
+            if "original_line" in c and c["original_line"] is not None:
+                formatted.append(f"<line>{c['original_line']}</line>")
+            formatted.append("</review_comment>")
+            comment_index += 1
 
-    text = []
-    with open('temp.pdf', 'rb') as pdf_file:
-        pdf_reader = PdfReader(pdf_file)
-        for page in range(len(pdf_reader.pages)):
-            text.append(pdf_reader.pages[page].extract_text())
+    formatted.append("</diff_and_comments>")
+    formatted.append("</pull_request_info>")
 
-    formatted_text = f'<source type="arxiv_paper" url={escape_xml_attr(arxiv_abs_url)}>\n'
-    formatted_text += '<paper>\n'
-    formatted_text += escape_xml_text(' '.join(text))
-    formatted_text += '\n</paper>\n'
-    formatted_text += '</source>'
+    # include repository snapshot
+    repo_url = f"https://github.com/{repo_owner}/{repo_name}"
+    formatted.append("<repository>")
+    formatted.append(process_github_repo(repo_url))
+    formatted.append("</repository>")
+    formatted.append("</source>")
 
-    os.remove('temp.pdf')
-    print("ArXiv paper processed successfully.")
+    print(f"Pull request {pr_number} and repository content processed successfully.")
+    return "\n".join(formatted)
 
-    return formatted_text
 
-def extract_links(input_file, output_file):
-    url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
-    
-    with open(input_file, 'r', encoding='utf-8') as file:
-        content = file.read()
-        urls = re.findall(url_pattern, content)
-    
-    with open(output_file, 'w', encoding='utf-8') as output:
-        for url in urls:
-            output.write(url + '\n')
+def process_github_issue(issue_url: str) -> str:
+    require_token("GitHub issues")
+    parts = issue_url.split("/")
+    repo_owner = parts[3]
+    repo_name = parts[4]
+    issue_number = parts[-1]
 
-def fetch_youtube_transcript(url):
-    def extract_video_id(url):
-        pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-        return None
+    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/issues/{issue_number}"
+    r = SESSION.get(api_url, timeout=30)
+    r.raise_for_status()
+    issue_data = r.json()
 
-    video_id = extract_video_id(url)
-    if not video_id:
-        return f'<source type="youtube_transcript" url={escape_xml_attr(url)}>\n<error>Could not extract video ID from URL.</error>\n</source>'
+    comments_url = issue_data["comments_url"]
+    cr = SESSION.get(comments_url, timeout=30)
+    cr.raise_for_status()
+    comments_data = cr.json()
 
-    try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        formatter = TextFormatter()
-        transcript = formatter.format_transcript(transcript_list)
+    formatted = [f'<source type="github_issue" url={escape_xml_attr(issue_url)}>']
+    formatted.append("<issue_info>")
+    formatted.append(f"<title>{escape_xml_text(issue_data.get('title',''))}</title>")
+    formatted.append(f"<description>{escape_xml_text(issue_data.get('body',''))}</description>")
+    formatted.append("<comments>")
 
-        formatted_text = f'<source type="youtube_transcript" url={escape_xml_attr(url)}>\n'
-        formatted_text += '<transcript>\n'
-        formatted_text += escape_xml_text(transcript)
-        formatted_text += '\n</transcript>\n'
-        formatted_text += '</source>'
+    for comment in comments_data:
+        formatted.append("<comment>")
+        formatted.append(f"<author>{escape_xml_text(comment['user']['login'])}</author>")
+        body = comment.get("body", "")
+        formatted.append(f"<content>{escape_xml_text(body)}</content>")
 
-        return formatted_text
-    except Exception as e:
-        return f'<source type="youtube_transcript" url={escape_xml_attr(url)}>\n<error>{escape_xml_text(str(e))}</error>\n</source>'
+        # Extract GitHub code links like ...#L12-L34
+        code_snippets = re.findall(r"https://github.com/.*#L\d+-L\d+", body or "")
+        for snippet_url in code_snippets:
+            url_parts = snippet_url.split("#")
+            file_url = url_parts[0].replace("/blob/", "/raw/")
+            start_str, end_str = url_parts[1].split("-")
+            start_line = int(start_str[1:])
+            end_line = int(end_str[1:])
 
-def preprocess_text(input_file, output_file):
-    with open(input_file, "r", encoding="utf-8") as input_file:
-        input_text = input_file.read()
+            fr = SESSION.get(file_url, timeout=30)
+            fr.raise_for_status()
+            file_content = fr.text
 
-    def process_text(text):
-        text = re.sub(r"[\n\r]+", "\n", text)
-        # Update the following line to include apostrophes and quotation marks
-        text = re.sub(r"[^a-zA-Z0-9\s_.,!?:;@#$%^&*()+\-=[\]{}|\\<>`~'\"/]+", "", text)
-        text = re.sub(r"\s+", " ", text)
-        text = text.lower()
-        words = text.split()
-        words = [word for word in words if word not in stop_words]
-        return " ".join(words)
+            code_lines = file_content.split("\n")[start_line - 1 : end_line]
+            code_snippet = "\n".join(code_lines)
 
-    try:
-        # Try to parse the input as XML
-        root = ET.fromstring(input_text)
+            formatted.append("<code_snippet>")
+            formatted.append(f"<![CDATA[{code_snippet}]]>")
+            formatted.append("</code_snippet>")
 
-        # Process text content while preserving XML structure
-        for elem in root.iter():
-            if elem.text:
-                elem.text = process_text(elem.text)
-            if elem.tail:
-                elem.tail = process_text(elem.tail)
+        formatted.append("</comment>")
 
-        # Write the processed XML to the output file
-        tree = ET.ElementTree(root)
-        tree.write(output_file, encoding="utf-8", xml_declaration=True)
-        print("Text preprocessing completed with XML structure preserved.")
-    except ET.ParseError:
-        # If XML parsing fails, process the text without preserving XML structure
-        processed_text = process_text(input_text)
-        with open(output_file, "w", encoding="utf-8") as out_file:
-            out_file.write(processed_text)
-        print("XML parsing failed. Text preprocessing completed without XML structure.")
+    formatted.append("</comments>")
+    formatted.append("</issue_info>")
 
-def get_token_count(text, disallowed_special=[], chunk_size=1000):
-    enc = tiktoken.get_encoding("cl100k_base")
+    # include repository snapshot
+    repo_url = f"https://github.com/{repo_owner}/{repo_name}"
+    formatted.append("<repository>")
+    formatted.append(process_github_repo(repo_url))
+    formatted.append("</repository>")
+    formatted.append("</source>")
 
-    # Remove XML tags
-    text_without_tags = re.sub(r'<[^>]+>', '', text)
+    print(f"Issue {issue_number} and repository content processed successfully.")
+    return "\n".join(formatted)
 
-    # Split the text into smaller chunks
-    chunks = [text_without_tags[i:i+chunk_size] for i in range(0, len(text_without_tags), chunk_size)]
-    total_tokens = 0
 
-    for chunk in chunks:
-        tokens = enc.encode(chunk, disallowed_special=disallowed_special)
-        total_tokens += len(tokens)
-    
-    return total_tokens
+# ----------------------------
+# Web crawling / PDFs / YouTube / arXiv
+# ----------------------------
 
 def is_same_domain(base_url, new_url):
     return urlparse(base_url).netloc == urlparse(new_url).netloc
 
+
 def is_within_depth(base_url, current_url, max_depth):
-    base_parts = urlparse(base_url).path.rstrip('/').split('/')
-    current_parts = urlparse(current_url).path.rstrip('/').split('/')
-
-    if current_parts[:len(base_parts)] != base_parts:
+    base_parts = urlparse(base_url).path.rstrip("/").split("/")
+    current_parts = urlparse(current_url).path.rstrip("/").split("/")
+    if current_parts[: len(base_parts)] != base_parts:
         return False
-
     return len(current_parts) - len(base_parts) <= max_depth
 
-def process_pdf(url):
-    response = requests.get(url)
-    response.raise_for_status()
 
-    with open('temp.pdf', 'wb') as pdf_file:
-        pdf_file.write(response.content)
+def process_pdf(url):
+    resp = SESSION.get(url, timeout=60)
+    resp.raise_for_status()
+    with open("temp.pdf", "wb") as pdf_file:
+        pdf_file.write(resp.content)
 
     text = []
-    with open('temp.pdf', 'rb') as pdf_file:
+    with open("temp.pdf", "rb") as pdf_file:
         pdf_reader = PdfReader(pdf_file)
         for page in range(len(pdf_reader.pages)):
             text.append(pdf_reader.pages[page].extract_text())
 
-    os.remove('temp.pdf')
-    return ' '.join(text)
+    try:
+        os.remove("temp.pdf")
+    except OSError:
+        pass
+    return " ".join(text)
+
 
 def crawl_and_extract_text(base_url, max_depth, include_pdfs, ignore_epubs):
     visited_urls = set()
@@ -348,332 +504,192 @@ def crawl_and_extract_text(base_url, max_depth, include_pdfs, ignore_epubs):
 
     while urls_to_visit:
         current_url, current_depth = urls_to_visit.pop(0)
-        clean_url = current_url.split('#')[0]
+        clean_url = current_url.split("#")[0]
 
-        if clean_url not in visited_urls and is_same_domain(base_url, clean_url) and is_within_depth(base_url, clean_url, max_depth):
-            if ignore_epubs and clean_url.endswith('.epub'):
-                continue
+        if clean_url in visited_urls:
+            continue
+        if not (is_same_domain(base_url, clean_url) and is_within_depth(base_url, clean_url, max_depth)):
+            continue
 
-            try:
-                response = requests.get(current_url)
-                soup = BeautifulSoup(response.content, 'html.parser')
-                visited_urls.add(clean_url)
+        if ignore_epubs and clean_url.lower().endswith(".epub"):
+            continue
 
-                if clean_url.endswith('.pdf') and include_pdfs:
-                    text = process_pdf(clean_url)
-                else:
-                    for element in soup(['script', 'style', 'head', 'title', 'meta', '[document]']):
-                        element.decompose()
-                    comments = soup.find_all(string=lambda text: isinstance(text, Comment))
-                    for comment in comments:
-                        comment.extract()
-                    text = soup.get_text(separator='\n', strip=True)
+        try:
+            resp = SESSION.get(current_url, timeout=60)
+            resp.raise_for_status()
+            content_type = resp.headers.get("Content-Type", "")
+            is_pdf = clean_url.lower().endswith(".pdf") or "application/pdf" in content_type
 
-                all_text.append(f'<page url={escape_xml_attr(clean_url)}>' )
-                all_text.append(escape_xml_text(text))
-                all_text.append('</page>')
-                processed_urls.append(clean_url)
-                print(f"Processed: {clean_url}")
+            if is_pdf and include_pdfs:
+                text = process_pdf(clean_url)
+                soup = None
+            else:
+                soup = BeautifulSoup(resp.content, "html.parser")
+                for e in soup(["script", "style", "noscript", "template", "head", "title", "meta", "link"]):
+                    e.decompose()
+                for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
+                    c.extract()
+                text = "\n".join(line for line in soup.get_text("\n").splitlines() if line.strip())
 
-                if current_depth < max_depth:
-                    for link in soup.find_all('a', href=True):
-                        new_url = urljoin(current_url, link['href']).split('#')[0]
-                        if new_url not in visited_urls and is_within_depth(base_url, new_url, max_depth) and (include_pdfs or not new_url.endswith('.pdf')) and not (ignore_epubs and new_url.endswith('.epub')):
-                            urls_to_visit.append((new_url, current_depth + 1))
+            all_text.append(f"<page url={escape_xml_attr(clean_url)}>")
+            all_text.append(escape_xml_text(text))
+            all_text.append("</page>")
+            processed_urls.append(clean_url)
+            visited_urls.add(clean_url)
+            print(f"Processed: {clean_url}")
 
-            except requests.RequestException as e:
-                print(f"Failed to retrieve {clean_url}: {e}")
+            if soup is not None and current_depth < max_depth:
+                for link in soup.find_all("a", href=True):
+                    new_url = urljoin(current_url, link["href"]).split("#")[0]
+                    if new_url not in visited_urls:
+                        if include_pdfs or not new_url.lower().endswith(".pdf"):
+                            if not (ignore_epubs and new_url.lower().endswith(".epub")):
+                                if is_within_depth(base_url, new_url, max_depth):
+                                    urls_to_visit.append((new_url, current_depth + 1))
 
-    all_text.append('</source>')
-    formatted_content = '\n'.join(all_text)
+        except requests.RequestException as e:
+            print(f"Failed to retrieve {clean_url}: {e}")
 
-    return {
-        'content': formatted_content,
-        'processed_urls': processed_urls
-    }
+    all_text.append("</source>")
+    formatted_content = "\n".join(all_text)
+    return {"content": formatted_content, "processed_urls": processed_urls}
+
+
+def process_arxiv_pdf(arxiv_abs_url):
+    pdf_url = arxiv_abs_url.replace("/abs/", "/pdf/") + ".pdf"
+    resp = SESSION.get(pdf_url, timeout=60)
+    resp.raise_for_status()
+
+    with open("temp.pdf", "wb") as pdf_file:
+        pdf_file.write(resp.content)
+
+    text = []
+    with open("temp.pdf", "rb") as pdf_file:
+        pdf_reader = PdfReader(pdf_file)
+        for page in range(len(pdf_reader.pages)):
+            text.append(pdf_reader.pages[page].extract_text())
+
+    try:
+        os.remove("temp.pdf")
+    except OSError:
+        pass
+
+    formatted_text = f'<source type="arxiv_paper" url={escape_xml_attr(arxiv_abs_url)}>\n'
+    formatted_text += "<paper>\n"
+    formatted_text += escape_xml_text(" ".join(text))
+    formatted_text += "\n</paper>\n"
+    formatted_text += "</source>"
+
+    print("ArXiv paper processed successfully.")
+    return formatted_text
+
+
+def extract_links(input_file, output_file):
+    url_pattern = re.compile(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+")
+    with open(input_file, "r", encoding="utf-8") as f:
+        content = f.read()
+        urls = re.findall(url_pattern, content)
+    with open(output_file, "w", encoding="utf-8") as out:
+        for url in urls:
+            out.write(url + "\n")
+
+
+def fetch_youtube_transcript(url):
+    def extract_video_id(u):
+        pattern = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})"
+        m = re.search(pattern, u)
+        if m:
+            return m.group(1)
+        return None
+
+    vid = extract_video_id(url)
+    if not vid:
+        return f'<source type="youtube_transcript" url={escape_xml_attr(url)}>\n<error>Could not extract video ID from URL.</error>\n</source>'
+
+    try:
+        transcript_list = YouTubeTranscriptApi.get_transcript(vid)
+        formatter = TextFormatter()
+        transcript = formatter.format_transcript(transcript_list)
+
+        formatted_text = f'<source type="youtube_transcript" url={escape_xml_attr(url)}>\n'
+        formatted_text += "<transcript>\n"
+        formatted_text += escape_xml_text(transcript)
+        formatted_text += "\n</transcript>\n"
+        formatted_text += "</source>"
+        return formatted_text
+    except Exception as e:
+        return f'<source type="youtube_transcript" url={escape_xml_attr(url)}>\n<error>{escape_xml_text(str(e))}</error>\n</source>'
+
 
 def process_doi_or_pmid(identifier):
+    if not ALLOW_SCIHUB:
+        return (
+            f'<source type="sci_hub_paper" identifier={escape_xml_attr(identifier)}>\n'
+            f"<error>Disabled by default. Set ALLOW_SCIHUB=1 to enable (beware legal/ToS).</error>\n"
+            f"</source>"
+        )
+
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 6.3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36',
-        'Connection': 'keep-alive'
+        "User-Agent": "Mozilla/5.0 (Windows NT 6.3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36",
+        "Connection": "keep-alive",
     }
 
     try:
-        payload = {
-            'sci-hub-plugin-check': '',
-            'request': identifier
-        }
+        payload = {"sci-hub-plugin-check": "", "request": identifier}
+        base_url = "https://sci-hub.se/"
+        response = SESSION.post(base_url, headers=headers, data=payload, timeout=60)
+        response.raise_for_status()
 
-        base_url = 'https://sci-hub.se/'
-        response = requests.post(base_url, headers=headers, data=payload, timeout=60)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        pdf_element = soup.find(id='pdf')
+        soup = BeautifulSoup(response.content, "html.parser")
+        pdf_element = soup.find(id="pdf")
 
         if pdf_element is None:
-            raise ValueError(f"No PDF found for identifier {identifier}. Sci-hub might be inaccessible or the document is not available.")
+            raise ValueError(
+                f"No PDF found for identifier {identifier}. Sci-hub might be inaccessible or the document is not available."
+            )
 
-        content = pdf_element.get('src').replace('#navpanes=0&view=FitH', '').replace('//', '/')
+        content = pdf_element.get("src").replace("#navpanes=0&view=FitH", "").replace("//", "/")
 
-        if content.startswith('/downloads'):
-            pdf_url = 'https://sci-hub.se' + content
-        elif content.startswith('/tree'):
-            pdf_url = 'https://sci-hub.se' + content
-        elif content.startswith('/uptodate'):
-            pdf_url = 'https://sci-hub.se' + content
+        if content.startswith("/downloads"):
+            pdf_url = "https://sci-hub.se" + content
+        elif content.startswith("/tree"):
+            pdf_url = "https://sci-hub.se" + content
+        elif content.startswith("/uptodate"):
+            pdf_url = "https://sci-hub.se" + content
         else:
-            pdf_url = 'https:/' + content
+            pdf_url = "https:/" + content
 
         pdf_filename = f"{identifier.replace('/', '-')}.pdf"
         wget.download(pdf_url, pdf_filename)
 
-        with open(pdf_filename, 'rb') as pdf_file:
+        with open(pdf_filename, "rb") as pdf_file:
             pdf_reader = PdfReader(pdf_file)
             text = ""
             for page in range(len(pdf_reader.pages)):
                 text += pdf_reader.pages[page].extract_text()
 
         formatted_text = f'<source type="sci_hub_paper" identifier={escape_xml_attr(identifier)}>\n'
-        formatted_text += '<paper>\n'
+        formatted_text += "<paper>\n"
         formatted_text += escape_xml_text(text)
-        formatted_text += '\n</paper>\n'
-        formatted_text += '</source>'
+        formatted_text += "\n</paper>\n"
+        formatted_text += "</source>"
 
         os.remove(pdf_filename)
         print(f"Identifier {identifier} processed successfully.")
         return formatted_text
     except (requests.RequestException, ValueError) as e:
         error_text = f'<source type="sci_hub_paper" identifier={escape_xml_attr(identifier)}>\n'
-        error_text += f'<error>{escape_xml_text(str(e))}</error>\n'
-        error_text += '</source>'
+        error_text += f"<error>{escape_xml_text(str(e))}</error>\n"
+        error_text += "</source>"
         print(f"Error processing identifier {identifier}: {str(e)}")
         print("Sci-hub appears to be inaccessible or the document was not found. Please try again later.")
         return error_text
-        
-def process_github_pull_request(pull_request_url):
-    url_parts = pull_request_url.split("/")
-    repo_owner = url_parts[3]
-    repo_name = url_parts[4]
-    pull_request_number = url_parts[-1]
-
-    api_base_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls/{pull_request_number}"
-    headers = {"Authorization": f"token {TOKEN}"}
-
-    response = requests.get(api_base_url, headers=headers)
-    pull_request_data = response.json()
-
-    diff_url = pull_request_data["diff_url"]
-    diff_response = requests.get(diff_url, headers=headers)
-    pull_request_diff = diff_response.text
-
-    comments_url = pull_request_data["comments_url"]
-    review_comments_url = pull_request_data["review_comments_url"]
-    comments_response = requests.get(comments_url, headers=headers)
-    review_comments_response = requests.get(review_comments_url, headers=headers)
-    comments_data = comments_response.json()
-    review_comments_data = review_comments_response.json()
-
-    all_comments = comments_data + review_comments_data
-    all_comments.sort(key=lambda comment: comment.get("position") or float("inf"))
-
-    formatted_text = f'<source type="github_pull_request" url={escape_xml_attr(pull_request_url)}>\n'
-    formatted_text += '<pull_request_info>\n'
-    formatted_text += f'<title>{escape_xml_text(pull_request_data["title"])}</title>\n'
-    formatted_text += f'<description>{escape_xml_text(pull_request_data["body"])}</description>\n'
-    formatted_text += '<merge_details>\n'
-    formatted_text += f'{escape_xml_text(pull_request_data["user"]["login"])} wants to merge {pull_request_data["commits"]} commit into {repo_owner}:{pull_request_data["base"]["ref"]} from {pull_request_data["head"]["label"]}\n'
-    formatted_text += '</merge_details>\n'
-    formatted_text += '<diff_and_comments>\n'
-
-    diff_lines = pull_request_diff.split("\n")
-    comment_index = 0
-    for line in diff_lines:
-        formatted_text += f'{escape_xml_text(line)}\n'
-        while comment_index < len(all_comments) and all_comments[comment_index].get("position") == diff_lines.index(line):
-            comment = all_comments[comment_index]
-            formatted_text += f'<review_comment>\n'
-            formatted_text += f'<author>{escape_xml_text(comment["user"]["login"])}</author>\n'
-            formatted_text += f'<content>{escape_xml_text(comment["body"])}</content>\n'
-            formatted_text += f'<path>{escape_xml_text(comment["path"])}</path>\n'
-            formatted_text += f'<line>{comment["original_line"]}</line>\n'
-            formatted_text += '</review_comment>\n'
-            comment_index += 1
-
-    formatted_text += '</diff_and_comments>\n'
-    formatted_text += '</pull_request_info>\n'
-
-    repo_url = f"https://github.com/{repo_owner}/{repo_name}"
-    repo_content = process_github_repo(repo_url)
-    
-    formatted_text += '<repository>\n'
-    formatted_text += repo_content
-    formatted_text += '</repository>\n'
-    formatted_text += '</source>'
-
-    print(f"Pull request {pull_request_number} and repository content processed successfully.")
-
-    return formatted_text
-    
-def escape_xml_text(text: str) -> str:
-    """Escape minimal XML characters for text nodes (& and <). Leave > for readability."""
-    s = str(text)
-    return s.replace("&", "&amp;").replace("<", "&lt;")
-
-def escape_xml_attr(value: str) -> str:
-    """Escape and quote an XML attribute value safely (includes surrounding quotes)."""
-    return quoteattr(str(value))
-
-def process_github_issue(issue_url):
-    url_parts = issue_url.split("/")
-    repo_owner = url_parts[3]
-    repo_name = url_parts[4]
-    issue_number = url_parts[-1]
-
-    api_base_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/issues/{issue_number}"
-    headers = {"Authorization": f"token {TOKEN}"}
-
-    response = requests.get(api_base_url, headers=headers)
-    issue_data = response.json()
-
-    comments_url = issue_data["comments_url"]
-    comments_response = requests.get(comments_url, headers=headers)
-    comments_data = comments_response.json()
-
-    formatted_text = f'<source type="github_issue" url={escape_xml_attr(issue_url)}>\n'
-    formatted_text += '<issue_info>\n'
-    formatted_text += f'<title>{escape_xml_text(issue_data["title"])}</title>\n'
-    formatted_text += f'<description>{escape_xml_text(issue_data["body"])}</description>\n'
-    formatted_text += '<comments>\n'
-
-    for comment in comments_data:
-        formatted_text += '<comment>\n'
-        formatted_text += f'<author>{escape_xml_text(comment["user"]["login"])}</author>\n'
-        formatted_text += f'<content>{escape_xml_text(comment["body"])}</content>\n'
-
-        code_snippets = re.findall(r'https://github.com/.*#L\d+-L\d+', comment['body'])
-        for snippet_url in code_snippets:
-            url_parts = snippet_url.split("#")
-            file_url = url_parts[0].replace("/blob/", "/raw/")
-            line_range = url_parts[1]
-            # Correct parsing of line range like L12-L34
-            start_str, end_str = line_range.split("-")
-            start_line = int(start_str[1:])
-            end_line = int(end_str[1:])
-
-            file_response = requests.get(file_url, headers=headers)
-            file_content = file_response.text
-
-            code_lines = file_content.split("\n")[start_line-1:end_line]
-            code_snippet = "\n".join(code_lines)
-
-            formatted_text += '<code_snippet>\n'
-            formatted_text += f'<![CDATA[{code_snippet}]]>\n'
-            formatted_text += '</code_snippet>\n'
-
-        formatted_text += '</comment>\n'
-
-    formatted_text += '</comments>\n'
-    formatted_text += '</issue_info>\n'
-
-    repo_url = f"https://github.com/{repo_owner}/{repo_name}"
-    repo_content = process_github_repo(repo_url)
-    
-    formatted_text += '<repository>\n'
-    formatted_text += repo_content
-    formatted_text += '</repository>\n'
-    formatted_text += '</source>'
-
-    print(f"Issue {issue_number} and repository content processed successfully.")
-
-    return formatted_text
 
 
-def is_excluded_file(filename):
-    """
-    Check if a file should be excluded based on patterns.
+# ----------------------------
+# Main
+# ----------------------------
 
-    Args:
-        filename (str): The file path to check
-
-    Returns:
-        bool: True if the file should be excluded, False otherwise
-    """
-    excluded_patterns = [
-        '.pb.go',  # Proto generated Go files
-        '_grpc.pb.go',  # gRPC generated Go files
-        'mock_',  # Mock files
-        '/generated/',  # Generated files in a generated directory
-        '/mocks/',  # Mock files in a mocks directory
-        '.gen.',  # Generated files with .gen. in name
-        '_generated.',  # Generated files with _generated in name
-    ]
-
-    return any(pattern in filename for pattern in excluded_patterns)
-
-
-def is_allowed_filetype(filename):
-    """
-    Check if a file should be processed based on its extension and exclusion patterns.
-
-    Args:
-        filename (str): The file path to check
-
-    Returns:
-        bool: True if the file should be processed, False otherwise
-    """
-    # First check if file matches any exclusion patterns
-    if is_excluded_file(filename):
-        return False
-
-    # Then check if it has an allowed extension
-    allowed_extensions = [
-        # Markdown / Documentation
-        '.md', '.txt', '.mdx',
-
-        # Kotlin / Java core logic
-        '.kt', '.kts', '.java',
-
-        # Android config and resources
-        '.xml', '.gradle', '.gradle.kts', '.pro',  # build.gradle, ProGuard, etc.
-
-        # Build tooling
-        '.properties', '.toml', '.lock',  # gradle.properties, libs.versions.toml
-        
-        # Flutter / Dart
-        '.dart',
-        
-        # Minecraft Quests
-        '.snbt',
-
-    # Java (already covered above, keep once)
-    '.java', '.gradle',
-
-        # Project-specific data/schema
-        '.fbs',
-        '.jsonl',
-
-        # Git and environment configs
-        '.gitignore', '.env', '.gitattributes',
-
-        # Web-related (if using WebView or hybrid tech)
-        '.html', '.js', '.ts', '.tsx', '.jsx', '.json', '.yaml', '.yml', '.css', '.mjs', '.mts',
-
-        # Shell scripts and setup files
-        '.sh', '.bash', '.zsh',
-
-        # Backend / API / scripting
-        '.go', '.proto', '.py', '.ipynb',
-
-        # Optional: Cross-platform / monorepo extras
-        '.rs', '.c', '.cpp', '.h', '.hpp', '.xaml',      # Rust / C++
-        '.cs', '.csproj', '.fs', '.vb',          # .NET / F#
-        '.ex', '.exs', '.eex', '.erl',           # Elixir / Erlang
-    ]
-
-
-
-
-    return any(filename.endswith(ext) for ext in allowed_extensions)
-    
 def main():
     console = Console()
 
@@ -706,7 +722,7 @@ def main():
         input_path = sys.argv[1]
     else:
         input_path = Prompt.ask("\n[bold dodger_blue1]Enter the path or URL[/bold dodger_blue1]", console=console)
-    
+
     console.print(f"\n[bold bright_green]You entered:[/bold bright_green] [bold bright_yellow]{input_path}[/bold bright_yellow]\n")
 
     output_file = "uncompressed_output.txt"
@@ -723,42 +739,48 @@ def main():
         task = progress.add_task("[bright_blue]Processing...", total=100)
 
         try:
+            # Route by input type
             if "github.com" in input_path:
+                require_token("GitHub repositories/PRs/issues")
                 if "/pull/" in input_path:
                     final_output = process_github_pull_request(input_path)
                 elif "/issues/" in input_path:
                     final_output = process_github_issue(input_path)
                 else:
                     final_output = process_github_repo(input_path)
+
             elif urlparse(input_path).scheme in ["http", "https"]:
                 if "youtube.com" in input_path or "youtu.be" in input_path:
                     final_output = fetch_youtube_transcript(input_path)
                 elif "arxiv.org" in input_path:
                     final_output = process_arxiv_pdf(input_path)
                 else:
-                    crawl_result = crawl_and_extract_text(input_path, max_depth=2, include_pdfs=True, ignore_epubs=True)
-                    final_output = crawl_result['content']
-                    with open(urls_list_file, 'w', encoding='utf-8') as urls_file:
-                        urls_file.write('\n'.join(crawl_result['processed_urls']))
-            elif input_path.startswith("10.") and "/" in input_path or input_path.isdigit():
+                    crawl_result = crawl_and_extract_text(
+                        input_path, max_depth=2, include_pdfs=True, ignore_epubs=True
+                    )
+                    final_output = crawl_result["content"]
+                    with open(urls_list_file, "w", encoding="utf-8") as urls_file:
+                        urls_file.write("\n".join(crawl_result["processed_urls"]))
+
+            elif (input_path.startswith("10.") and "/" in input_path) or input_path.isdigit():
                 final_output = process_doi_or_pmid(input_path)
+
             else:
+                # Local path
                 final_output = process_local_folder(input_path)
 
             progress.update(task, advance=50)
 
-            # Write the uncompressed output with context note about escaping rules
+            # Write uncompressed with context note
             context_note = (
                 "<!-- Note: Minimal XML escaping applied. In text: & -> &amp;, < -> &lt; (we keep '>' literal). "
                 "Attributes are safely quoted & escaped. -->\n"
             )
-            with open(output_file, "w", encoding="utf-8") as file:
-                file.write(context_note + final_output)
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(context_note + final_output)
 
-
-            # Process the compressed output
+            # Compressed output
             preprocess_text(output_file, processed_file)
-
             progress.update(task, advance=50)
 
             compressed_text = safe_file_read(processed_file)
@@ -769,15 +791,18 @@ def main():
             uncompressed_token_count = get_token_count(uncompressed_text)
             console.print(f"[bright_green]Uncompressed Token Count:[/bright_green] [bold bright_cyan]{uncompressed_token_count}[/bold bright_cyan]")
 
-            console.print(f"\n[bold bright_yellow]{processed_file}[/bold bright_yellow] and [bold bright_blue]{output_file}[/bold bright_blue] have been created in the working directory.")
+            console.print(
+                f"\n[bold bright_yellow]{processed_file}[/bold bright_yellow] and "
+                f"[bold bright_blue]{output_file}[/bold bright_blue] have been created in the working directory."
+            )
 
-            pyperclip.copy(uncompressed_text)
-            console.print(f"\n[bright_white]The contents of [bold bright_blue]{output_file}[/bold bright_blue] have been copied to the clipboard.[/bright_white]")
+            try_copy_to_clipboard(uncompressed_text, console)
 
         except Exception as e:
             console.print(f"\n[bold red]An error occurred:[/bold red] {str(e)}")
             console.print("\nPlease check your input and try again.")
-            raise  # Re-raise the exception for debugging purposes
-        
+            raise  # Re-raise for CI logs
+
+
 if __name__ == "__main__":
     main()
