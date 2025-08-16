@@ -27,11 +27,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq curl git
 
-      - name: Get latest commit SHA from PenguLoader/PenguLoader
+      - name: Resolve latest upstream commit (PenguLoader/PenguLoader)
         id: latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           API="https://api.github.com/repos/PenguLoader/PenguLoader/commits?per_page=1"
           LATEST_SHA=$(curl -s -H "Authorization: token ${GH_TOKEN}" "$API" | jq -r '.[0].sha')
           if [ -z "$LATEST_SHA" ] || [ "$LATEST_SHA" = "null" ]; then
@@ -42,6 +43,7 @@ jobs:
       - name: Read last processed SHA
         id: last
         run: |
+          set -euo pipefail
           mkdir -p state output
           if [ -f state/latest_sha.txt ]; then
             echo "last_sha=$(cat state/latest_sha.txt)" >> "$GITHUB_OUTPUT"
@@ -56,6 +58,7 @@ jobs:
       - name: Clone PenguLoader (depth=1)
         if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         run: |
+          set -euo pipefail
           rm -rf work && mkdir -p work
           git clone --depth 1 https://github.com/PenguLoader/PenguLoader.git work/PenguLoader
 
@@ -73,9 +76,10 @@ jobs:
           which python
           python -m pip -V
 
-      - name: Install Python deps (optional)
+      - name: Install Python deps (if present)
         if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         run: |
+          set -euo pipefail
           if [ -f 1filellm/requirements.txt ]; then
             python -m pip install --upgrade pip
             python -m pip install -r 1filellm/requirements.txt
@@ -83,24 +87,34 @@ jobs:
             echo "No 1filellm/requirements.txt found; continuing..."
           fi
 
-      - name: Run your local onefilellm.py
+      - name: Run onefilellm (no stdout redirection)
         if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
+        env:
+          # Not strictly needed for local-path mode, but harmless and future-proof
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [ ! -f "1filellm/onefilellm.py" ]; then
-            echo "ERROR: 1filellm/onefilellm.py not found in repo root."
-            exit 1
-          fi
-          python 1filellm/onefilellm.py work/PenguLoader > output/pengu_onefile.txt
-          cp output/pengu_onefile.txt "output/pengu_onefile_${{ steps.latest.outputs.latest_sha }}.txt"
+          # This writes uncompressed_output.txt and compressed_output.txt in CWD
+          python 1filellm/onefilellm.py work/PenguLoader
+
+          # Ensure output directory exists
+          mkdir -p output
+
+          # Stamp filenames with upstream commit SHA
+          COMMIT_SHA="${{ steps.latest.outputs.latest_sha }}"
+
+          # Move the REAL outputs produced by the script
+          mv compressed_output.txt "output/pengu_onefile_compressed_${COMMIT_SHA}.txt"
+          mv uncompressed_output.txt "output/pengu_onefile_uncompressed_${COMMIT_SHA}.txt"
 
       - name: Commit & push results
         if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         run: |
+          set -euo pipefail
           echo "${{ steps.latest.outputs.latest_sha }}" > state/latest_sha.txt
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state/latest_sha.txt output/pengu_onefile.txt output/pengu_onefile_${{ steps.latest.outputs.latest_sha }}.txt
+          git add state/latest_sha.txt output/
           if git diff --cached --quiet; then
             echo "Nothing to commit."
           else
@@ -108,11 +122,9 @@ jobs:
             git push
           fi
 
-      - name: Upload CI artifact
+      - name: Upload artifact (compressed & uncompressed)
         if: steps.latest.outputs.latest_sha != steps.last.outputs.last_sha
         uses: actions/upload-artifact@v4
         with:
-          name: pengu_onefile_${{ steps.latest.outputs.latest_sha }}
-          path: |
-            output/pengu_onefile.txt
-            output/pengu_onefile_${{ steps.latest.outputs.latest_sha }}.txt
+          name: pengu-onefile-${{ steps.latest.outputs.latest_sha }}
+          path: output/
